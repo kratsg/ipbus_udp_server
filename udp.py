@@ -5,6 +5,9 @@ import struct
 from config import *
 import textwrap
 
+# global register of 32-bit words
+REG = ['00000000']*100
+
 '''
 ================================================
                     HELPERS
@@ -38,32 +41,29 @@ def printBreakdown(**kwargs):
 
     words = kwargs.get('words', [])
     indentLevel = kwargs.get('indentLevel', 0)  # default to 0
-    addr = kwargs.get('addr', ('127.0.0.1',8000))  # default address and port
+    addr_from = kwargs.get('addr_from', ('127.0.0.1',8000))  # default address and port
     inbound = kwargs.get('inbound', True)  # assume inbound
 
     outStr.append("="*PRINT_LENGTH)
     outStr.append(dumpStr.format("{0:s}{1:s} Message{0:s}".format("-"*(PRINT_LENGTH/2 - 9), "Inbound " if inbound else "Outbound")))
-    # print inbound or outbound
-    outStr.append(dumpStr.format("    From: {:s}".format(addr)))
+
+    outStr.append(dumpStr.format("    From: {:s}".format(addr_from)))
+
+    if inbound is not True:
+      addr_to = kwargs.get('addr_to')  # default address and port
+      outStr.append(dumpStr.format("    To  : {:s}".format(addr_to)))
+
     outStr.append(dumpStr.format("    Data"))
     for i, word in enumerate(words):
       outStr.append(dumpStr.format("     |- Word {:d}    {:s}".format(i, word)))
-    outStr.append(dumpStr.format("     ---------------------"))
+    # outStr.append(dumpStr.format("     ---------------------"))
+    outStr.append(dumpStr.format(""))
     outStr.append("="*PRINT_LENGTH)
     print(("\t"*indentLevel)+("\n"+"\t"*indentLevel).join(outStr))
     return True
 
 def printPacketDetails(packet, indentLevel=0):
   print(("\t"*indentLevel)+("\n"+"\t"*indentLevel).join(packet['str']))
-  return True
-
-def printPacketsBreakdown(packets, indentLevel=0):
-  outStr = []
-  for i,v in enumerate(packets):
-    binNumber = ' '.join(chunks(bin(int(v, 16))[2:].zfill(32), 8))
-    outStr.append("Word {:d} = {:s}".format(i, v))
-    outStr.append("\t{:s}".format(binNumber))
-  print(("\t"*indentLevel)+("\n"+"\t"*indentLevel).join(outStr))
   return True
 
 '''
@@ -196,13 +196,59 @@ sock = socket.socket(socket.AF_INET, # Internet
 sock.bind((UDP_IP, UDP_PORT))
 
 def controlHandler(words):
-  parsed_transactionData = decodeTransactionHeader(words[0])
-  print("Transaction Details")
-  printPacketDetails(parsed_transactionData, indentLevel=1)
+  # at this point, we could have N different transactions that we should read
+  #   in line by line to determine how many words are being used for each
+
+  def writeHandler(words, numWords):
+    global REG
+    location, value = map(lambda x: flipEndian(x), words)
+    print("\t\tLocation: {:s}\n\t\tValue:  {:s}".format(location, value))
+    REG[int(location, 16)] = value
+    return []
+
+  def readHandler(words, numWords):
+    print("\t\t{:d} 32-bit words from\n\t\tLocation: {:s}".format(numWords, words[0]))
+    return [flipEndian('00000001')]*numWords
+
+  def writeNonIncHandler(words, numWords):
+    pass
+
+  def readNonIncHandler(words, numWords):
+    pass
+
+  def getNumWords(transactionHeader):
+    numWords = int(transactionHeader['words'], 16)
+    if transactionHeader['type_id'] in ['1','3']:
+      numWords += 1
+    return numWords
  
-  print("Responding to Control Request")
+  handler = {'0': readHandler,
+             '1': writeHandler,
+             '2': readNonIncHandler,
+             '3': writeNonIncHandler}
+
   responsePackets = []
-  responsePackets.append(encodeWord(TRANSACTION_HEADER_FORMAT, word=parsed_transactionData, info_code='0'))
+
+  # handle chunking the words based on transaction header
+  numSkipped = 0
+  totalSkip = 0
+
+  for i in range(len(words)):
+    if numSkipped == totalSkip:
+      numSkipped = totalSkip = 0
+      transactionHeader = decodeTransactionHeader(words[i])
+      print("Handling Transaction")
+      # printPacketDetails(transactionHeader, indentLevel=2)
+ 
+      responsePackets.append(encodeWord(TRANSACTION_HEADER_FORMAT, word=transactionHeader, info_code='0'))
+      numWords = getNumWords(transactionHeader)
+      print("\t{:s}".format(words[i:i+1+numWords]))
+      print("\tHandling Control Type: {}".format(decodeTransactionType(transactionHeader)))
+      responsePackets += handler[transactionHeader['type_id']](words[i+1:i+1+numWords], numWords)
+      totalSkip = numWords
+    else:
+      numSkipped += 1
+
   return responsePackets
  
 def statusHandler(words):
@@ -221,7 +267,7 @@ while True:
     # encode it in hex
     data = data.encode("hex")
     words = list(chunks(data,8))
-    printBreakdown(words=words)
+    printBreakdown(words=words, addr_from=addr)
 
     # Step 0: determine endian-ness using packet header
     checkEndian(words[0])
@@ -230,15 +276,18 @@ while True:
     print("Packet Header")
     printPacketDetails(packetHeader, indentLevel=1)
 
+    # get the packet type
     packetType = decodePacketType(packetHeader)
-    print("Handling Packet Type:", packetType)
+
+    # start building the response packet
+    responsePackets = [encodeWord(PACKET_HEADER_FORMAT, word=packetHeader)]
+
+    # at this point, we could have N different transactions that we should read
+    #   in line by line to determine how many words are being used for each
     handler = packetTypeHandler.get(packetType, lambda: print("ValueError: unknown type"))
-    responsePackets = handler(words[1:])  # return a list of response words
+    responsePackets += handler(words[1:])  # return a list of response words
 
-    # printPacketsBreakdown(words, indentLevel=1)
-
-    responsePackets.insert(0, encodeWord(PACKET_HEADER_FORMAT, word=packetHeader))
-    printBreakdown(words=responsePackets, inbound=False, addr=(UDP_IP, UDP_PORT))
+    printBreakdown(words=responsePackets, inbound=False, addr_from=(UDP_IP, UDP_PORT), addr_to=addr)
 
     print("Sending", end="")
     sock.sendto((''.join(responsePackets)).decode("hex"), addr)
